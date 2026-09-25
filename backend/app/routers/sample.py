@@ -1,4 +1,4 @@
-"""取样检测接口：维护检测单，覆盖开始检测、判定合格、判定不合格等动作。"""
+"""取样检测接口：维护检测单，覆盖开始检测、判定合格、判定不合格，以及检测值对标准限值的自动判定与人工改判。"""
 from __future__ import annotations
 
 from typing import Any
@@ -12,7 +12,7 @@ router = APIRouter(prefix="/api/sample", tags=["取样检测"])
 
 service = SampleService()
 
-LIST_FIELDS = ["检测单号", "取样点位", "检测项目", "检测值", "标准限值", "检测结论", "检测人员", "检测状态"]
+LIST_FIELDS = ["检测单号", "取样点位", "检测项目", "检测值", "标准限值", "检测结论", "判定方式", "超标口径", "判定说明", "检测人员", "检测状态"]
 STATUSES = ["待取样", "检测中", "合格", "不合格"]
 
 
@@ -28,6 +28,61 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/judgement/lookup", response_model=ActionResult)
+def lookup_judgement(
+    order_no: str = Query(alias="orderNo", description="检测单号"),
+    point: str = Query(description="取样点位"),
+) -> ActionResult:
+    """按检测单号与取样点位读取检测值与标准限值，供自动判定前核对。"""
+    entry = service.find_by_key(order_no, point)
+    if entry is None:
+        same_order = service.find_by_order(order_no)
+        if same_order is not None:
+            return ActionResult(
+                ok=False,
+                message=f"检测单号 {order_no} 登记的取样点位是「{same_order.get('取样点位')}」，"
+                f"与查询的「{point}」不一致",
+            )
+        return ActionResult(ok=False, message=f"检测单号 {order_no}（点位 {point}）尚未登记")
+    return ActionResult(ok=True, message="已读取检测值与标准限值", entry=entry)
+
+
+@router.post("/judgement/auto", response_model=ActionResult)
+def auto_judge(payload: EntryPayload) -> ActionResult:
+    """自动判定：按检测单号与取样点位读取检测值与限值，按阈值给出合格判定。
+
+    检测值为空、限值缺失、单号点位对不上、同一单号重复提交都会在 message 里说明原因。
+    """
+    values = payload.values
+    entry, message, ok = service.auto_judge(
+        str(values.get("检测单号") or ""),
+        str(values.get("取样点位") or ""),
+    )
+    return ActionResult(ok=ok, message=message, entry=entry)
+
+
+@router.post("/judgement/override", response_model=ActionResult)
+def manual_override(payload: EntryPayload) -> ActionResult:
+    """人工改判入口：可覆盖自动判定结论，但必须填写改判原因。"""
+    values = payload.values
+    entry, message = service.manual_override(
+        str(values.get("检测单号") or ""),
+        str(values.get("取样点位") or ""),
+        str(values.get("检测结论") or ""),
+        str(values.get("改判原因") or ""),
+    )
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出取样检测清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "sample", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +111,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出取样检测清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "sample", "total": total, "items": items}
